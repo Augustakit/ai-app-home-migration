@@ -1,6 +1,6 @@
 # DSH 数据目录迁移手册（执行版）
 
-配套 `SKILL.md`；事实依据 `facts.md`；工作区搬迁见 `workspace-move.md`。
+配套 `SKILL.md`；事实依据 `dsh-facts.md`；工作区搬迁见 `dsh-workspace-move.md`。
 
 ## 0. 方案选择
 
@@ -117,15 +117,30 @@ Get-Item -LiteralPath $src -Force | Select-Object LinkType, Target
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 迁移脚本说 DSH 在运行 | 托盘/后台进程未退 | 完全退出后重试 |
-| 目标已存在且非空 | 路径填错 | 换空目录，不要合并 |
+| 改名探测失败 / 改名退路失败 | 源目录句柄被外部进程占用（资源管理器窗口/终端工作目录；DSH 进程守卫抓不到） | 关闭所有资源管理器窗口与停在源目录的终端后重跑；续作模式会跳过已完成的复制 |
+| 目标已存在且非空 | 上次 Cutover 中途失败（正常）或路径填错 | 直接重跑，续作模式会校验源/目标一致后继续；确认路径填错才换空目录 |
 | 路径超长 | 目标根太长，`LongPathsEnabled=0` | 用短路径（如 `X:\DSH\.dsh`） |
-| 校验失败 | 复制期间 DSH 还在写 / 文件被锁 | 关 DSH，删目标，重试 |
+| 校验失败 | 复制期间 DSH 还在写 / 文件被锁 | 关 DSH 重跑；续作校验不一致时会提示人工核对清理目标 |
 | 重启后还是旧数据 | 用户级 `DSH_HOME` 指向别处 | `Verify` 看 `DSH_HOME`；改对或加 `-SetDshHome` |
 | 插件全没 | 删过 `node_modules`，DSH 不会自动装 | `Repair-DshPnpm.ps1`；仍缺包则 `dsh plugin install` |
 | `ERR_PNPM_UNEXPECTED_STORE` | store 记录与当前 pnpm 解析不一致 | `Repair-DshPnpm.ps1 -Execute` |
 | 会话跑到别的工作区/消失 | `workspace.json` 的 `path` 与 session cwd 的真实路径不一致 | 见 `workspace-move.md`；数据没丢 |
 | 退路删不掉 | 里面有链接 / 权限 | 先按 `-CleanupBackup` 的安全流程；不要右键递归删除 |
 | `mklink /J` 被拒绝 | 目标不是 NTFS / 杀软 / 目标已存在 | 换本地 NTFS；加杀软排除；先处理旧链接 |
+
+## 6b. 合并工作区 / 归组漂移会话（已验证）
+
+场景：数据分叉后出现两个工作区（典型：`DSH_HOME` 误指向空目录，DSH 在新位置自建了全新数据根，见 `dsh-facts.md` §1），或会话 cwd 与注册工作区路径漂移后落入"未分组"。
+
+前提：DSH 完全退出；旧位置若有真实内容，先逐项并入存续数据根（`sessions/` 子目录、`.credentials.yaml`、`.anonymous-user-id`、工作区注册表条目），确认无独有数据后再动路径。
+
+步骤：
+
+1. 编辑存续数据根的 `storages/workspace.json`：删除多余的工作区条目（`global.workspaceIds` + `tables.workspaces` 两处），保留目标工作区。**文件必须按 UTF-8（无 BOM）读写**：PowerShell 5.1 的 `Get-Content` 默认按 ANSI 解码无 BOM 文件，中文标题会变乱码——用 `[System.IO.File]::ReadAllText/WriteAllText` 并显式传 UTF-8 编码。
+2. 在被删工作区的旧路径留 Junction，指向存续工作区真实路径：
+   `New-Item -ItemType Junction -Path '<旧工作区路径>' -Target '<存续工作区路径>'`（旧路径若还有同名真实目录，确认已并入后删除再建）。
+3. 重启 DSH：会话按 `fs.realpath(旧路径) → 存续路径` 自动归组，不需要改任何会话文件（机制见 `dsh-facts.md` §3）。
+4. 边界：没有任何已选工作区的空会话（wwd 为空）不会被 Junction 捕获，重启后仍是"未分组"——这类通常是空壳，DSH 关闭时直接删除该会话文件夹即可，注册表残留引用会自愈。
 
 ## 7. 工作区目录（可选）
 
