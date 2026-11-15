@@ -53,6 +53,8 @@ $s = '<SKILL_DIR>\scripts\dsh'
 - **如果 Agent 跑在 DSH 里**：不能自己关闭宿主再执行 Cutover。Agent 可以完成 Discover/Prepare/Verify 的准备与说明，**最后一步必须由用户在 DSH 外双击向导或在外部终端执行**。不要尝试杀 DSH 进程。
 - 目标必须是本地 NTFS、非盘根、不在源树内、空间 ≥ 源 × 1.15、路径尽量短（脚本会检查）。
 - **源树内部 reparse point 必须为 0**：脚本会先扫描；非零会停，因为 `/XJ` 会跳过它们导致缺数据。
+- **迁移前关闭所有资源管理器窗口与停在源/目标目录里的终端**：目录句柄被外部进程占用时，改名退路必然失败（DSH 进程守卫抓不到这类占用）。脚本启动时做改名探测提前暴露；若 Cutover 阶段仍被占，关闭后直接重跑即可。
+- **Cutover 中途失败可重跑（续作模式）**：复制/校验完成后的任何失败（句柄占用、Junction 建立失败等），重跑脚本会检测到目标已有数据，跳过复制、直接校验源/目标一致后从失败点继续。state 文件记录 `resume/copied/verified/junctionCreated` 阶段标记。
 - 复制后逐文件比对相对路径 + 大小；旧目录改名 `*.dshbak`，不删除。
 - 迁移后核验项：Junction 目标、`DSH_HOME`、profile 三件套、`.modules.yaml` 的 `storeDir` == DSH 自带 pnpm 的 `store path`、`storages/workspace.json` 可读、sessions 数量、卷 NTFS。
 - 插件报 `ERR_PNPM_UNEXPECTED_STORE`：用 `Repair-DshPnpm.ps1 -Execute`，**不要先删 `node_modules`**（DSH 启动不会自动重装，会跳过插件）。
