@@ -1,4 +1,4 @@
-﻿<#
+<#
   DSH 数据目录整目录迁移（Windows PowerShell 5.1，无第三方运行时）
 
   做法：把 %USERPROFILE%\.dsh（或 DSH_HOME 指向的目录）整体复制到目标盘，
@@ -292,11 +292,16 @@ if ($innerLinks.Count -gt 0) {
 }
 Say '源树内部 reparse point：0 个（/XJ 安全）。'
 
-# 3) 目标检查
+# 3) 目标检查；目标非空时进入续作模式（上次 Cutover 中途失败的恢复路径）
+$ResumeCopy = $false
 if (Test-Path -LiteralPath $dst) {
   $di = Get-Item -LiteralPath $dst -Force
   if (Test-IsReparse $di) { throw "目标路径本身是链接，拒绝操作：$dst" }
-  if (@(Get-ChildItem -LiteralPath $dst -Force).Count -gt 0) { throw "目标已存在且不是空目录：$dst" }
+  if (@(Get-ChildItem -LiteralPath $dst -Force).Count -gt 0) {
+    $ResumeCopy = $true
+    Say "目标已存在且非空：$dst"
+    Say '续作模式：跳过复制，先对源/目标做逐文件校验；一致则继续改名 + Junction，不一致则提示人工处理。'
+  }
 }
 $vol = Get-VolumeInfo $dst
 if ($null -eq $vol) { throw "无法读取目标盘信息：$dst" }
@@ -312,9 +317,13 @@ Say ("源目录：{0} 个文件，{1:N2} MB，最长相对路径 {2} 字符" -f 
 
 $free = [int64]$vol.FreeSpace
 if ($null -eq $free) { throw "无法读取目标盘剩余空间：$dst" }
-$needed = [int64]($srcBytes * 1.15)
-Say ("目标盘剩余：{0:N2} GB；需要至少 {1:N2} GB（源 × 1.15）" -f ($free / 1GB), ($needed / 1GB))
-if ($free -lt $needed) { throw "目标盘空间不足" }
+if (-not $ResumeCopy) {
+  $needed = [int64]($srcBytes * 1.15)
+  Say ("目标盘剩余：{0:N2} GB；需要至少 {1:N2} GB（源 × 1.15）" -f ($free / 1GB), ($needed / 1GB))
+  if ($free -lt $needed) { throw "目标盘空间不足" }
+} else {
+  Say ("目标盘剩余：{0:N2} GB（续作模式：数据已在目标盘，跳过空间前置检查）" -f ($free / 1GB))
+}
 
 $longPaths = Get-LongPathsEnabled
 $projected = $dst.Length + $maxRel
@@ -342,24 +351,98 @@ if (-not $SkipDshHomeGuard) {
 if ($PlanOnly) {
   Say ''
   Say '【演练】将执行：'
-  Say "  1. robocopy /E /XJ 复制 $($srcMap.Count) 个文件到 $dst"
-  Say '  2. 逐文件比对相对路径 + 大小'
-  Say "  3. 原目录改名为 $bak（留退路）"
-  Say "  4. 在 $src 建 Junction -> $dst"
-  Say '  5. 写入探针，验证经原路径新建的文件出现在目标盘'
-  if ($SetDshHome) { Say "  6. 设用户级 DSH_HOME=$dst" }
+  if ($ResumeCopy) {
+    Say '  0. 续作模式：目标已有数据，跳过复制，先逐文件校验源/目标一致性'
+    Say '  1. 原目录改名为退路（留退路）'
+    Say "  2. 在 $src 建 Junction -> $dst"
+    Say '  3. 写入探针，验证经原路径新建的文件出现在目标盘'
+  } else {
+    Say '  1. 改名探测（把源目录改名后立即改回，提前暴露目录句柄占用）'
+    Say "  2. robocopy /E /XJ 复制 $($srcMap.Count) 个文件到 $dst"
+    Say '  3. 逐文件比对相对路径 + 大小'
+    Say "  4. 原目录改名为 $bak（留退路）"
+    Say "  5. 在 $src 建 Junction -> $dst"
+    Say '  6. 写入探针，验证经原路径新建的文件出现在目标盘'
+  }
+  if ($SetDshHome) { Say "  7. 设用户级 DSH_HOME=$dst" }
   Say '【演练】未改动任何文件。去掉 -WhatIf 才会正式执行。'
   exit 0
 }
 
-# 4) 复制
+# 3b) 改名探测：目录句柄被资源管理器窗口/终端工作目录占用时，改名退路必然失败。
+# 在复制之前把源目录改名后立即改回，把这类失败暴露在动手之前（未改动任何数据）。
 Say ''
-Say '--- 开始复制 ---'
-New-Item -ItemType Directory -Path $dst -Force | Out-Null
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-& robocopy $src $dst /E /COPY:DAT /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { throw "复制失败，robocopy 退出码 $LASTEXITCODE。源目录未改动。" }
-Say ("复制完成（robocopy 退出码 {0}，{1:N1} 秒）。" -f $LASTEXITCODE, $sw.Elapsed.TotalSeconds)
+Say '--- 改名探测（提前暴露目录句柄占用）---'
+$leaf = [System.IO.Path]::GetFileName($src.TrimEnd('\'))
+$probeName = $leaf + '.__probe' + (Get-Random)
+try {
+  Rename-Item -LiteralPath $src -NewName $probeName -ErrorAction Stop
+} catch {
+  Say '改名探测失败：源目录句柄被外部进程占用，改名退路必然同样失败。'
+  Say '常见原因：资源管理器窗口或某个终端的工作目录停在源目录（或其上级）。'
+  Say '请关闭后重跑本脚本。未改动任何文件。'
+  exit 1
+}
+$backOk = $false
+foreach ($i in 1..3) {
+  try {
+    Rename-Item -LiteralPath (Join-Path (Split-Path -Parent $src) $probeName) -NewName $leaf -ErrorAction Stop
+    $backOk = $true
+    break
+  } catch { Start-Sleep -Seconds 1 }
+}
+if (-not $backOk) {
+  throw ("改名探测后无法把 {0} 改回 {1}（极少见）。请手工改回后重试。" -f (Join-Path (Split-Path -Parent $src) $probeName), $leaf)
+}
+Say '改名探测通过：源目录句柄未被占用。'
+
+# 3c) 写 state（在复制/改名之前落盘，任何阶段失败都有回滚依据）
+if ([string]::IsNullOrWhiteSpace($StateDir)) {
+  $StateDir = Join-Path $env:LOCALAPPDATA 'dsh-migration'
+}
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$statePath = Join-Path $StateDir ("state-$stamp-$PID.json")
+$envBefore = Get-UserDshHome
+$state = [ordered]@{
+  tool = $ToolName
+  version = $ToolVersion
+  createdAt = (Get-Date).ToString('s')
+  status = 'preparing'
+  mode = 'junction'
+  source = $src
+  target = $dst
+  backup = $bak
+  resume = [bool]$ResumeCopy
+  setDshHome = [bool]$SetDshHome
+  envBefore = $envBefore
+  envAfter = $null
+  files = $srcMap.Count
+  bytes = $srcBytes
+  copied = [bool]$ResumeCopy
+  verified = $false
+  junctionCreated = $false
+}
+Write-JsonFile $statePath $state
+Say ''
+Say "回滚状态文件：$statePath"
+
+# 4) 复制（续作模式跳过：上次已复制并校验过，直接进入校验确认）
+if ($ResumeCopy) {
+  Say ''
+  Say '--- 续作：跳过复制，直接进入逐文件校验 ---'
+} else {
+  Say ''
+  Say '--- 开始复制 ---'
+  New-Item -ItemType Directory -Path $dst -Force | Out-Null
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  & robocopy $src $dst /E /COPY:DAT /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "复制失败，robocopy 退出码 $LASTEXITCODE。源目录未改动。回滚状态文件：$statePath" }
+  Say ("复制完成（robocopy 退出码 {0}，{1:N1} 秒）。" -f $LASTEXITCODE, $sw.Elapsed.TotalSeconds)
+}
+$state.copied = $true
+$state.status = 'copied'
+Write-JsonFile $statePath $state
 
 # 5) 校验
 Say '--- 逐文件校验 ---'
@@ -374,44 +457,34 @@ $extra = @($dstMap.Keys | Where-Object { -not $srcMap.ContainsKey($_) })
 if ($missing.Count -gt 0 -or $sizeBad.Count -gt 0) {
   Say "校验失败：缺失 $($missing.Count) 个、大小不一致 $($sizeBad.Count) 个。"
   ($missing + $sizeBad) | Select-Object -First 10 | ForEach-Object { Say "  $_" }
-  Say '源目录未改动；目标目录保留供检查。'
+  if ($ResumeCopy) {
+    Say '续作校验不一致：目标疑似中断残留或之后被改动。请人工核对后清理目标目录，'
+    Say '清理后重跑本脚本将重新完整复制。源目录未改动。'
+  } else {
+    Say '源目录未改动；目标目录保留供检查。'
+  }
   exit 1
 }
 if ($extra.Count -gt 0) { Say "注意：目标比源多 $($extra.Count) 个文件（可能是复制期间新写入，请人工确认）。" }
 Say "逐文件校验通过：$($srcMap.Count) 个文件全部一致。"
-
-# 6) 写 state（在改名/建链接之前，便于回滚）
-if ([string]::IsNullOrWhiteSpace($StateDir)) {
-  $StateDir = Join-Path $env:LOCALAPPDATA 'dsh-migration'
-}
-New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$statePath = Join-Path $StateDir ("state-$stamp-$PID.json")
-$envBefore = Get-UserDshHome
-$state = [ordered]@{
-  tool = $ToolName
-  version = $ToolVersion
-  createdAt = (Get-Date).ToString('s')
-  status = 'switching'
-  mode = 'junction'
-  source = $src
-  target = $dst
-  backup = $bak
-  setDshHome = [bool]$SetDshHome
-  envBefore = $envBefore
-  envAfter = $null
-  files = $srcMap.Count
-  bytes = $srcBytes
-  junctionCreated = $false
-}
+$state.verified = $true
+$state.status = 'verified'
 Write-JsonFile $statePath $state
-Say ''
-Say "回滚状态文件：$statePath"
+
+# 6) state 已在复制前落盘（含 resume/copied/verified 阶段标记），此处无需重建；
+#    改名与建 Junction 失败时，直接重跑本脚本即可按续作模式继续。
 
 # 7) 改名留退路 + 建 Junction
 if (Test-Path -LiteralPath $bak) { throw "退路已存在，请先处理：$bak" }
 $leaf = [System.IO.Path]::GetFileName($src)
-Rename-Item -LiteralPath $src -NewName ($leaf + $BackupSuffix) -ErrorAction Stop
+try {
+  Rename-Item -LiteralPath $src -NewName ($leaf + $BackupSuffix) -ErrorAction Stop
+} catch {
+  Say '改名退路失败：源目录句柄被外部进程占用（常见：资源管理器窗口/终端工作目录）。'
+  Say '关闭后直接重跑本脚本——续作模式会跳过复制，从这一步继续。'
+  Say "回滚状态文件：$statePath"
+  exit 1
+}
 Say "原目录已改名：$bak"
 try {
   $link = New-Item -ItemType Junction -Path $src -Target $dst -ErrorAction Stop
@@ -419,9 +492,12 @@ try {
 } catch {
   Rename-Item -LiteralPath $bak -NewName $leaf -ErrorAction SilentlyContinue
   Say "建 Junction 失败，已回滚：$($_.Exception.Message)"
+  Say '排除原因后直接重跑本脚本——续作模式会跳过复制，从这一步继续。'
   exit 1
 }
 $state.junctionCreated = $true
+$state.status = 'junction-created'
+Write-JsonFile $statePath $state
 Say "Junction 已建立：$src -> $dst"
 
 # 8) 穿透 + 写入探针
@@ -435,6 +511,8 @@ try {
   if (-not $probeOk) { throw '经原路径写入的探针文件没有出现在目标盘' }
   Say '写入探针通过：经原路径新建的文件确实落在目标盘。'
 } catch {
+  $state.status = 'probe-failed'
+  Write-JsonFile $statePath $state
   Say "探针失败：$($_.Exception.Message)"
   Say '请人工检查 Junction；如需回滚，请用 Rollback-DshMigration.ps1 -StateFile 上面那个文件。'
   exit 1
